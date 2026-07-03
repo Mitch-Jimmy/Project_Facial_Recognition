@@ -1,0 +1,181 @@
+import cv2
+import csv
+import time
+
+face_cascade = cv2.CascadeClassifier(
+        "/usr/share/opencv4/haarcascades/haarcascade_frontalface_default.xml"
+    )
+
+if face_cascade.empty():
+    print("Failed to load face cscade")
+    exit()
+
+eye_cascade = cv2.CascadeClassifier(
+        "/usr/share/opencv4/haarcascades/haarcascade_eye.xml"
+    )
+
+if eye_cascade.empty():
+    print("Failed to load eye cascade")
+    exit()
+
+log = open("motion_log.csv", "w", newline="")
+writer = csv.writer(log)
+writer.writerow(["t", "frame", "motion", "objects", "faces", "eyes_open", "eyes"])
+
+gst = (
+        "v4l2src device=/dev/video0 ! "
+        "image/jpeg, width=320, height=240, framerate=30/1 !"
+        "jpegdec ! videoconvert ! video/x-raw,format=GRAY8 ! appsink"
+    )
+
+cap = cv2.VideoCapture(gst, cv2.CAP_GSTREAMER)
+
+if not cap.isOpened():
+    print("Camera not found")
+    exit()
+
+frames = 0
+start = time.time()
+prev_edges = None
+motion_pixels = 0
+
+motion_avg = 0.0
+alpha = 0.2
+noise_floor = 600
+area_thresh = 500
+
+in_motion = False
+START_TH = 800
+STOP_TH = 200
+
+face_present = 0
+face_streak = 0
+FACE_ON = 1
+FACE_OFF = 10
+
+eyes_open = 0
+eyes_streak = 0
+EYES_ON = 2
+EYES_OFF =2
+
+try:
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        frame_eq = cv2.equalizeHist(frame)
+        faces = face_cascade.detectMultiScale(
+                frame_eq,
+                scaleFactor = 1.1,
+                minNeighbors = 5,
+                minSize = (60, 60)
+             )
+        face_count = len(faces)
+
+        if face_count > 0:
+            face_streak = min(face_streak + 1, FACE_ON)
+        else:
+            face_streak = max(face_streak - 1, -FACE_OFF)
+
+        if face_streak >= FACE_ON:
+            face_present = 1
+        elif face_streak <= -FACE_OFF:
+            face_present = 0
+
+        eyes_count = 0
+        if face_present == 1 and face_count > 0:
+            x, y, w, h = max(faces, key=lambda r: r[2] * r[3])
+            face_roi = frame_eq[y:y+h, x:x+w]
+
+            upper = face_roi[: h // 2, :]
+
+            eyes = eye_cascade.detectMultiScale(
+                    upper,
+                    scaleFactor = 1.1,
+                    minNeighbors = 8,
+                    minSize = (20, 20)
+                )
+            eyes_count = len(eyes)
+
+            if frames % 30 == 0:
+                cv2.imwrite(f"face_{frames:04d}.png", face_roi)
+
+        if eyes_count >= 1:
+            eyes_streak = min(eyes_streak + 1, EYES_ON)
+        else:
+            eyes_streak = max(eyes_streak - 1, -EYES_OFF)
+
+        if eyes_streak >= EYES_ON:
+            eyes_open = 1
+        elif eyes_streak <= -EYES_OFF:
+            eyes_open = 0
+
+        frame = cv2.GaussianBlur(frame, (5, 5), 0)
+        edges = cv2.Canny(frame, 50, 150)
+
+        if prev_edges is not None:
+            motion = cv2.absdiff(edges, prev_edges)
+            _, motion_mask = cv2.threshold(motion, 25, 255, cv2.THRESH_BINARY)
+            motion_mask = cv2.dilate(motion_mask, None, iterations = 2)
+
+            mcontours, _ = cv2.findContours(
+                    motion_mask,
+                    cv2.RETR_EXTERNAL,
+                    cv2.CHAIN_APPROX_SIMPLE
+                 )
+            moving = [c for c in mcontours if cv2.contourArea(c) > area_thresh]
+
+            objects = 1 if moving else 0
+            motion_pixels = cv2.countNonZero(motion)
+        else:
+            motion_pixels = 0
+            objects = 0
+            motion_mask = None
+
+        prev_edges = edges.copy()
+
+        if motion_pixels < noise_floor:
+            motion_pixels = 0
+
+        motion_avg = alpha * motion_pixels + (1 - alpha) * motion_avg
+
+        if not in_motion and motion_avg > START_TH:
+            in_motion = True
+            print("EVENT: motion started")
+            cv2.imwrite(f"event_start_{frames:04d}.png", edges)
+            if motion_mask is not None:
+                cv2.imwrite(f"event_mask_{frames:04d}.png", motion_mask)
+
+        if in_motion and motion_avg < STOP_TH:
+            in_motion = False
+            print("EVENT: motion stopped")
+
+        if not in_motion:
+            objects = 0
+
+        if frames % 10 == 0:
+            print("Motion:", int(motion_avg),
+                    "Objects:", objects,
+                    "FacePresent:", face_present,
+                    "Faces:", face_count,
+                    "EyesOpen:", eyes_open,
+                    "Eyes:", eyes_count)
+
+        if frames % 30 ==0 and motion_mask is not None:
+            print(f"FPS: {frames / (time.time() - start):.2f}")
+            cv2.imwrite(f"edges_{frames:04d}.png", edges)
+
+        t = time.time() - start
+        writer.writerow([f"{t:.3f}", frames, int(motion_avg), objects, face_count, eyes_open, eyes_count])
+
+        frames += 1
+
+except KeyboardInterrupt:
+    print("Stopping...")
+
+finally:
+    elapsed = time.time() - start
+    print("FPS:", frames / elapsed)
+    cap.release()
+    log.close()
